@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>yt-dlp API — simple UI</title>
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f7fafc; color:#0f172a; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+    .card { background:white; padding:24px; border-radius:12px; box-shadow:0 6px 20px rgba(2,6,23,0.08); width:100%; max-width:720px; }
+    h1 { margin:0 0 12px 0; font-size:20px; }
+    label { display:block; margin-top:10px; font-size:13px; color:#334155; }
+    input[type="text"] { width:100%; padding:10px 12px; margin-top:6px; border-radius:8px; border:1px solid #e2e8f0; font-size:14px; }
+    .controls { margin-top:14px; display:flex; gap:8px; }
+    button { padding:10px 14px; border-radius:8px; border:0; cursor:pointer; font-weight:600; }
+    .btn-mp3 { background:#0ea5e9; color:white; }
+    .btn-mp4 { background:#10b981; color:white; }
+    .hint { margin-top:12px; font-size:13px; color:#64748b; }
+    .example { margin-top:6px; font-size:13px; color:#94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>yt-dlp API — download MP3 / MP4</h1>
+    <label for="videoUrl">Video URL</label>
+    <input id="videoUrl" type="text" placeholder="Paste YouTube / video URL here (e.g. https://youtu.be/dQw4w9WgXcQ)" />
+    <div class="controls">
+      <button class="btn-mp3" id="downloadMp3">Download MP3</button>
+      <button class="btn-mp4" id="downloadMp4">Download MP4</button>
+    </div>
+    <div class="hint">Tip: paste the URL and click a button — your browser will start the download.</div>
+    <div class="example">Example: https://youtu.be/dQw4w9WgXcQ</div>
+  </div>
+
+  <script>
+    const mp3Btn = document.getElementById("downloadMp3");
+    const mp4Btn = document.getElementById("downloadMp4");
+    const urlInput = document.getElementById("videoUrl");
+
+    function makeUrl(endpoint, videoUrl) {
+      return `${endpoint}?url=${encodeURIComponent(videoUrl)}`;
+    }
+
+    mp3Btn.addEventListener("click", () => {
+      const v = urlInput.value.trim();
+      if (!v) return alert("Please paste a video URL first.");
+      window.location = makeUrl("/api/mp3/url", v);
+    });
+
+    mp4Btn.addEventListener("click", () => {
+      const v = urlInput.value.trim();
+      if (!v) return alert("Please paste a video URL first.");
+      window.location = makeUrl("/api/mp4/url", v);
+    });
+
+    urlInput.value = "";
+  </script>
+</body>
+</html>
