@@ -15,6 +15,20 @@ const MAX_CACHE_FILES = 80; // adjust as needed
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+if (process.env.YT_C) {
+  try {
+    const cookiesPath = path.join(process.cwd(), "cookies.txt");
+    if (!fs.existsSync(cookiesPath)) {
+      fs.writeFileSync(cookiesPath, Buffer.from(process.env.YT_C, "base64"));
+      console.log("cookies.txt written from YT_C env");
+    } else {
+      console.log("cookies.txt already exists, skipping env write");
+    }
+  } catch (e) {
+    console.warn("Failed to write cookies from env:", e?.message || e);
+  }
+}
+
 // Helpers
 function hashUrl(url) {
   return crypto.createHash("sha256").update(url).digest("hex").slice(0, 18);
