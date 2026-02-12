@@ -1,58 +1,302 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>yt-dlp API — simple UI</title>
-  <style>
-    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f7fafc; color:#0f172a; display:flex; align-items:center; justify-content:center; min-height:100vh; }
-    .card { background:white; padding:24px; border-radius:12px; box-shadow:0 6px 20px rgba(2,6,23,0.08); width:100%; max-width:720px; }
-    h1 { margin:0 0 12px 0; font-size:20px; }
-    label { display:block; margin-top:10px; font-size:13px; color:#334155; }
-    input[type="text"] { width:100%; padding:10px 12px; margin-top:6px; border-radius:8px; border:1px solid #e2e8f0; font-size:14px; }
-    .controls { margin-top:14px; display:flex; gap:8px; }
-    button { padding:10px 14px; border-radius:8px; border:0; cursor:pointer; font-weight:600; }
-    .btn-mp3 { background:#0ea5e9; color:white; }
-    .btn-mp4 { background:#10b981; color:white; }
-    .hint { margin-top:12px; font-size:13px; color:#64748b; }
-    .example { margin-top:6px; font-size:13px; color:#94a3b8; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>yt-dlp API — download MP3 / MP4</h1>
-    <label for="videoUrl">Video URL</label>
-    <input id="videoUrl" type="text" placeholder="Paste YouTube / video URL here (e.g. https://youtu.be/dQw4w9WgXcQ)" />
-    <div class="controls">
-      <button class="btn-mp3" id="downloadMp3">Download MP3</button>
-      <button class="btn-mp4" id="downloadMp4">Download MP4</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>yt-dl API | x-kira</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --primary-blue: #00f2ff;
+        --secondary-blue: #0061ff;
+        --bg-dark: #050505;
+        --glass-bg: rgba(20, 20, 30, 0.4);
+        --glass-border: rgba(255, 255, 255, 0.1);
+        --text-main: #ffffff;
+        --text-muted: #9ca3af;
+      }
+
+      * {
+        box-sizing: border-box;
+        outline: none;
+      }
+
+      body {
+        font-family: "Inter", sans-serif;
+        background-color: var(--bg-dark);
+        color: var(--text-main);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        margin: 0;
+        overflow: hidden; /* Prevents scrollbars from moving blobs */
+        position: relative;
+      }
+
+      /* Animated Background Blobs for Blur Effect */
+      .blob {
+        position: absolute;
+        filter: blur(80px);
+        opacity: 0.6;
+        z-index: 0;
+        animation: float 10s infinite ease-in-out;
+      }
+      .blob-1 {
+        top: 10%;
+        left: 20%;
+        width: 300px;
+        height: 300px;
+        background: var(--secondary-blue);
+        animation-delay: 0s;
+      }
+      .blob-2 {
+        bottom: 20%;
+        right: 20%;
+        width: 250px;
+        height: 250px;
+        background: var(--primary-blue);
+        animation-delay: -5s;
+      }
+
+      @keyframes float {
+        0% {
+          transform: translate(0, 0) scale(1);
+        }
+        33% {
+          transform: translate(30px, -50px) scale(1.1);
+        }
+        66% {
+          transform: translate(-20px, 20px) scale(0.9);
+        }
+        100% {
+          transform: translate(0, 0) scale(1);
+        }
+      }
+
+      /* Glassmorphism Card */
+      .card {
+        background: var(--glass-bg);
+        padding: 40px;
+        border-radius: 24px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid var(--glass-border);
+        width: 100%;
+        max-width: 500px;
+        z-index: 1;
+        position: relative;
+        text-align: center;
+        transition: transform 0.3s ease;
+      }
+
+      .card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 15px 40px 0 rgba(0, 97, 255, 0.15);
+      }
+
+      h1 {
+        margin: 0 0 8px 0;
+        font-size: 28px;
+        font-weight: 600;
+        background: linear-gradient(to right, #fff, var(--primary-blue));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        letter-spacing: -0.5px;
+      }
+
+      .subtitle {
+        color: var(--text-muted);
+        font-size: 14px;
+        margin-bottom: 30px;
+      }
+
+      label {
+        display: block;
+        text-align: left;
+        margin-bottom: 8px;
+        font-size: 13px;
+        color: var(--primary-blue);
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+
+      /* Input Field */
+      .input-group {
+        position: relative;
+        margin-bottom: 25px;
+      }
+
+      input[type="text"] {
+        width: 100%;
+        padding: 16px 20px;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid var(--glass-border);
+        color: white;
+        font-size: 15px;
+        transition: all 0.3s ease;
+      }
+
+      input[type="text"]::placeholder {
+        color: rgba(255, 255, 255, 0.3);
+      }
+
+      input[type="text"]:focus {
+        border-color: var(--primary-blue);
+        box-shadow: 0 0 15px rgba(0, 242, 255, 0.2);
+        background: rgba(0, 0, 0, 0.6);
+      }
+
+      /* Buttons */
+      .controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 15px;
+        margin-top: 10px;
+      }
+
+      button {
+        padding: 14px;
+        border-radius: 12px;
+        border: 0;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 15px;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .btn-mp3 {
+        background: transparent;
+        border: 1px solid var(--secondary-blue);
+        color: var(--secondary-blue);
+        box-shadow: 0 0 10px rgba(0, 97, 255, 0.1);
+      }
+
+      .btn-mp3:hover {
+        background: var(--secondary-blue);
+        color: white;
+        box-shadow: 0 0 20px rgba(0, 97, 255, 0.6);
+      }
+
+      .btn-mp4 {
+        background: linear-gradient(
+          135deg,
+          var(--secondary-blue),
+          var(--primary-blue)
+        );
+        color: #000;
+        box-shadow: 0 0 15px rgba(0, 242, 255, 0.3);
+      }
+
+      .btn-mp4:hover {
+        filter: brightness(1.2);
+        transform: scale(1.02);
+        box-shadow: 0 0 25px rgba(0, 242, 255, 0.5);
+      }
+
+      /* Footer / Tips */
+      .hint {
+        margin-top: 25px;
+        font-size: 12px;
+        color: var(--text-muted);
+        opacity: 0.8;
+      }
+
+      .example {
+        margin-top: 8px;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.2);
+        word-break: break-all;
+      }
+
+      /* Mobile Responsive */
+      @media (max-width: 480px) {
+        .card {
+          padding: 25px;
+          margin: 20px;
+        }
+        .controls {
+          grid-template-columns: 1fr;
+        }
+        h1 {
+          font-size: 24px;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+
+    <div class="card">
+      <h1>YouTube Downloader</h1>
+      <div class="subtitle">Download MP3 audio or MP4 video instantly</div>
+
+      <label for="videoUrl">Paste Link</label>
+
+      <div class="input-group">
+        <input
+          id="videoUrl"
+          type="text"
+          placeholder="https://youtube.com/watch?v=..."
+          autocomplete="off"
+        />
+      </div>
+
+      <div class="controls">
+        <button class="btn-mp3" id="downloadMp3">Audio (MP3)</button>
+        <button class="btn-mp4" id="downloadMp4">Video (MP4)</button>
+      </div>
+
+      <div class="hint">Downloads start automatically in your browser.</div>
+      <div class="example">API: /api/mp3/url?url=YOUR_LINK</div>
+      <div class="hint">create by🤍 𝘴น𝚖𝔞ꪦ_𝗿ǿⲩ</div>
     </div>
-    <div class="hint">Tip: paste the URL and click a button — your browser will start the download.</div>
-    <div class="example">Example: https://youtu.be/dQw4w9WgXcQ</div>
-  </div>
 
-  <script>
-    const mp3Btn = document.getElementById("downloadMp3");
-    const mp4Btn = document.getElementById("downloadMp4");
-    const urlInput = document.getElementById("videoUrl");
+    <script>
+      const mp3Btn = document.getElementById("downloadMp3");
+      const mp4Btn = document.getElementById("downloadMp4");
+      const urlInput = document.getElementById("videoUrl");
 
-    function makeUrl(endpoint, videoUrl) {
-      return `${endpoint}?url=${encodeURIComponent(videoUrl)}`;
-    }
+      function makeUrl(endpoint, videoUrl) {
+        return `${endpoint}?url=${encodeURIComponent(videoUrl)}`;
+      }
 
-    mp3Btn.addEventListener("click", () => {
-      const v = urlInput.value.trim();
-      if (!v) return alert("Please paste a video URL first.");
-      window.location = makeUrl("/api/mp3/url", v);
-    });
+      mp3Btn.addEventListener("click", () => {
+        const v = urlInput.value.trim();
+        if (!v) {
+          // Added a simple shake animation trigger logic here if you wanted,
+          // but keeping it simple with the alert for now.
+          alert("Please paste a video URL first.");
+          urlInput.focus();
+          return;
+        }
+        window.location = makeUrl("/api/mp3/url", v);
+      });
 
-    mp4Btn.addEventListener("click", () => {
-      const v = urlInput.value.trim();
-      if (!v) return alert("Please paste a video URL first.");
-      window.location = makeUrl("/api/mp4/url", v);
-    });
+      mp4Btn.addEventListener("click", () => {
+        const v = urlInput.value.trim();
+        if (!v) {
+          alert("Please paste a video URL first.");
+          urlInput.focus();
+          return;
+        }
+        window.location = makeUrl("/api/mp4/url", v);
+      });
 
-    urlInput.value = "";
-  </script>
-</body>
+      // Auto-select text on click for better UX
+      urlInput.addEventListener("click", function () {
+        this.select();
+      });
+    </script>
+  </body>
 </html>

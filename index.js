@@ -1,28 +1,6 @@
-/**
- * Optimized yt-dlp API with caching + concurrent-download dedupe + Range support
- *
- * Endpoints:
- *  - GET /api/mp3/url?url=<VIDEO_URL>
- *  - GET /api/mp4/url?url=<VIDEO_URL>
- *
- * Behavior:
- *  - Caches files under ./cache/<hash>.<ext>
- *  - If same file requested while download is in-progress, waits for same download (no duplicate fetch)
- *  - MP4 served with Range support (works for in-browser play/seek)
- *  - Simple cache pruning: keep maxCacheFiles files
- *
- * Requirements:
- *  - Node 18+
- *  - npm install (see package.json)
- *  - ffmpeg recommended for MP3 conversion (auto-download attempted)
- *
- * Notes: If ytdlp-nodejs stream API differs, small adjustments may be needed.
- */
-
 import express from "express";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import sanitize from "sanitize-filename";
 import { pipeline } from "stream/promises";
 import { spawnSync } from "child_process";
@@ -35,15 +13,14 @@ const CACHE_DIR = path.join(process.cwd(), "cache");
 const publicDir = path.join(process.cwd(), "public");
 const MAX_CACHE_FILES = 80; // adjust as needed
 
-// ensure cache dir exists
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// helpers
+// Helpers
 function hashUrl(url) {
   return crypto.createHash("sha256").update(url).digest("hex").slice(0, 18);
 }
 function tmpFileNameFor(id, ext) {
-  return path.join(os.tmpdir(), `${id}.${ext}.part`);
+  return path.join(CACHE_DIR, `${id}.${ext}.part`);
 }
 function finalFilePathFor(id, ext) {
   return path.join(CACHE_DIR, `${id}.${ext}`);
@@ -60,8 +37,46 @@ function systemHasFfmpeg() {
     return false;
   }
 }
+async function moveFileAtomic(src, dest) {
+  try {
+    await fs.promises.rename(src, dest);
+    return;
+  } catch (err) {
+    if (err && err.code === "EXDEV") {
+      await fs.promises.copyFile(src, dest);
+      try {
+        await fs.promises.unlink(src);
+      } catch (e) {
+        /* ignore */
+      }
+      return;
+    }
+    throw err;
+  }
+}
+async function findCandidateAndMove(id, finalPath) {
+  const all = await fs.promises.readdir(CACHE_DIR);
+  const candidates = [];
+  for (const f of all) {
+    if (f.startsWith(id) && f !== path.basename(finalPath)) {
+      const full = path.join(CACHE_DIR, f);
+      try {
+        const s = await fs.promises.stat(full);
+        if (s.isFile() && s.size > 0)
+          candidates.push({ path: full, size: s.size, mtime: s.mtimeMs });
+      } catch {}
+    }
+  }
+  if (candidates.length === 0) return false;
+  candidates.sort((a, b) => {
+    if (b.size !== a.size) return b.size - a.size;
+    return b.mtime - a.mtime;
+  });
+  const chosen = candidates[0].path;
+  await moveFileAtomic(chosen, finalPath);
+  return true;
+}
 
-// simple LRU-ish prune based on mtime: keep newest MAX_CACHE_FILES files
 async function pruneCache() {
   try {
     const files = await fs.promises.readdir(CACHE_DIR);
@@ -89,16 +104,15 @@ async function pruneCache() {
   }
 }
 
-// map to track ongoing downloads: key => Promise
 const ongoing = new Map();
 
-// ensure ffmpeg available (try auto-download via ytdlp-nodejs, fallback to system)
+// ytdlp + ffmpeg readiness
 const ytdlp = new YtDlp();
 let ffmpegReady = false;
 async function prepareFfmpeg() {
   try {
     console.log("Trying to auto-download ffmpeg via ytdlp-nodejs...");
-    await ytdlp.downloadFFmpeg(); // may throw if not supported
+    await ytdlp.downloadFFmpeg();
     ffmpegReady = true;
     console.log("ffmpeg auto-downloaded (ytdlp-nodejs).");
   } catch (err) {
@@ -115,7 +129,6 @@ async function prepareFfmpeg() {
   }
 }
 
-// utility: try to get a nice title (fallback to url hash)
 async function getTitleFallback(url, id) {
   try {
     const t = await ytdlp.getTitleAsync(url);
@@ -124,88 +137,67 @@ async function getTitleFallback(url, id) {
   return id;
 }
 
-// Download-and-cache function (returns final file path when done)
 async function downloadAndCache(url, ext, ytdlpOptions = {}) {
-  // key by url+ext
   const id = hashUrl(url);
   const finalPath = finalFilePathFor(id, ext);
   const tmpPath = tmpFileNameFor(id, ext);
 
-  // if final file exists -> return immediately
   try {
     await fs.promises.access(finalPath, fs.constants.R_OK);
-    // update mtime for LRU behavior
     const now = new Date();
     await fs.promises.utimes(finalPath, now, now).catch(() => {});
     return { path: finalPath, id, cached: true };
-  } catch {
-    // not cached, continue
-  }
+  } catch {}
 
-  // If another download is ongoing for same key -> await it
   const key = `${id}.${ext}`;
-  if (ongoing.has(key)) {
-    // wait for existing promise
-    return ongoing.get(key);
-  }
+  if (ongoing.has(key)) return ongoing.get(key);
 
-  // start download, store a promise in map
   const promise = (async () => {
-    // remove leftover tmp if exists
     try {
       await fs.promises.unlink(tmpPath);
     } catch (e) {}
 
-    // determine output friendly name for metadata
     let title = id;
     try {
       title = await getTitleFallback(url, id);
     } catch (e) {}
 
-    // ensure parent dir
     await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
 
-    // build download options for ytdlp-nodejs
-    // For mp4: get audio+video and merge into mp4
-    // For mp3: extract audio and convert to mp3 (ffmpeg required)
-    let opts = {
-      output: tmpPath,
-      // default: let wrapper choose; we also pass format instructions
-      ...ytdlpOptions,
-    };
+    const opts = { output: tmpPath, ...ytdlpOptions };
 
-    // set format heuristics
     if (ext === "mp3") {
-      // require ffmpeg
       if (!ffmpegReady && !systemHasFfmpeg()) {
         throw new Error(
           "ffmpeg/ffprobe not available on server - mp3 cannot be created"
         );
       }
-      // request best audio and force mp3 conversion (wrapper will use ffmpeg)
       opts.format = { filter: "audioonly", type: "mp3" };
     } else if (ext === "mp4") {
-      // request best audio+video with mp4 container if possible
-      // Use audioandvideo + prefer mp4 container when possible
       opts.format = { filter: "audioandvideo", type: "mp4" };
     }
 
     try {
       console.log("Downloading:", url, "->", tmpPath);
-      // use ytdlp.download(...).run() as before
       await ytdlp.download(url, opts).run();
 
-      // rename tmp -> final (atomic-ish)
-      await fs.promises.rename(tmpPath, finalPath);
-      // update mtime
+      try {
+        await moveFileAtomic(tmpPath, finalPath);
+      } catch (mvErr) {
+        if (mvErr && (mvErr.code === "ENOENT" || mvErr.code === "ENOENT")) {
+          const found = await findCandidateAndMove(id, finalPath);
+          if (!found) throw mvErr; // no candidate -> rethrow
+        } else {
+          throw mvErr;
+        }
+      }
+
       const now = new Date();
       await fs.promises.utimes(finalPath, now, now).catch(() => {});
-      // prune cache asynchronously
       pruneCache().catch(() => {});
       console.log("Download complete:", finalPath);
       return { path: finalPath, id, title, cached: false };
     } catch (err) {
-      // cleanup tmp
       try {
         await fs.promises.unlink(tmpPath);
       } catch (_) {}
@@ -214,14 +206,9 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
   })();
 
   ongoing.set(key, promise);
-
-  // when done or error, remove from ongoing
   promise.then(() => ongoing.delete(key)).catch(() => ongoing.delete(key));
-
   return promise;
 }
-
-// Serve file with Range support (for video), or full file for audio
 async function serveFileWithRange(
   req,
   res,
@@ -248,7 +235,6 @@ async function serveFileWithRange(
       return;
     }
 
-    // parse Range
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
@@ -269,16 +255,13 @@ async function serveFileWithRange(
       res.status(500).json({ error: "file serve error", detail: String(err) });
   }
 }
-
-// serve static UI
 app.use(express.static(publicDir));
 app.get("/", (req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
-// mp3 endpoint
+// MP3 endpoint
 app.get("/api/mp3/url", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "missing url query param" });
-
   try {
     const id = hashUrl(url);
     const title = await getTitleFallback(url, id);
@@ -298,18 +281,16 @@ app.get("/api/mp3/url", async (req, res) => {
   }
 });
 
-// mp4 endpoint (Range support for browser playback)
+// MP4 endpoint
 app.get("/api/mp4/url", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "missing url query param" });
-
   try {
     const id = hashUrl(url);
     const title = await getTitleFallback(url, id);
     const suggestedName = humanSafeName(title, "mp4");
 
     const result = await downloadAndCache(url, "mp4");
-    // serve with range => supports play/seek in browser & fast start
     await serveFileWithRange(req, res, result.path, "video/mp4", suggestedName);
   } catch (err) {
     console.error("MP4 endpoint error:", err?.message || err);
@@ -317,7 +298,7 @@ app.get("/api/mp4/url", async (req, res) => {
   }
 });
 
-// small status endpoint to check cache / ongoing
+// status endpoint
 app.get("/_status", async (req, res) => {
   try {
     const cached = await fs.promises.readdir(CACHE_DIR).catch(() => []);
@@ -332,7 +313,7 @@ app.get("/_status", async (req, res) => {
   }
 });
 
-// prepare ffmpeg & start server
+// boot
 prepareFfmpeg().finally(() => {
   app.listen(PORT, () => {
     console.log(`Server listening on http://localhost:${PORT}`);
