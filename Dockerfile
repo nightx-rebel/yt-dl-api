@@ -18,8 +18,8 @@ RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o 
 WORKDIR /app
 
 # Copy package.json and install production deps
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+COPY package*.json ./
+RUN npm install 
 
 # Copy app
 COPY . .
