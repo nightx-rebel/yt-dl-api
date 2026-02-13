@@ -15,17 +15,27 @@ const MAX_CACHE_FILES = 80; // adjust as needed
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// Cookie setup
+let cookiesPath = null;
 if (process.env.YT_C) {
   try {
-    const cookiesPath = path.join(process.cwd(), "cookies.txt");
+    cookiesPath = path.join(process.cwd(), "cookies.txt");
     if (!fs.existsSync(cookiesPath)) {
       fs.writeFileSync(cookiesPath, Buffer.from(process.env.YT_C, "base64"));
       console.log("cookies.txt written from YT_C env");
     } else {
-      console.log("cookies.txt already exists, skipping env write");
+      console.log("cookies.txt already exists, using it");
     }
   } catch (e) {
     console.warn("Failed to write cookies from env:", e?.message || e);
+    cookiesPath = null;
+  }
+} else {
+  // Check if cookies.txt exists even without env var
+  const potentialPath = path.join(process.cwd(), "cookies.txt");
+  if (fs.existsSync(potentialPath)) {
+    cookiesPath = potentialPath;
+    console.log("Found existing cookies.txt");
   }
 }
 
@@ -178,7 +188,13 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
 
     await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
 
-    const opts = { output: tmpPath, ...ytdlpOptions };
+    // Build the download with proper cookie support
+    let downloadBuilder = ytdlp.download(url).output(tmpPath);
+
+    // Add cookies if available
+    if (cookiesPath) {
+      downloadBuilder = downloadBuilder.cookies(cookiesPath);
+    }
 
     if (ext === "mp3") {
       if (!ffmpegReady && !systemHasFfmpeg()) {
@@ -186,14 +202,21 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
           "ffmpeg/ffprobe not available on server - mp3 cannot be created"
         );
       }
-      opts.format = { filter: "audioonly", type: "mp3" };
+      downloadBuilder = downloadBuilder
+        .filter("audioonly")
+        .type("mp3")
+        .extractAudio()
+        .audioFormat("mp3");
     } else if (ext === "mp4") {
-      opts.format = { filter: "audioandvideo", type: "mp4" };
+      downloadBuilder = downloadBuilder
+        .filter("mergevideo")
+        .type("mp4")
+        .quality("highest");
     }
 
     try {
       console.log("Downloading:", url, "->", tmpPath);
-      await ytdlp.download(url, opts).run();
+      await downloadBuilder.run();
 
       try {
         await moveFileAtomic(tmpPath, finalPath);
@@ -223,6 +246,7 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
   promise.then(() => ongoing.delete(key)).catch(() => ongoing.delete(key));
   return promise;
 }
+
 async function serveFileWithRange(
   req,
   res,
@@ -269,6 +293,7 @@ async function serveFileWithRange(
       res.status(500).json({ error: "file serve error", detail: String(err) });
   }
 }
+
 app.use(express.static(publicDir));
 app.get("/", (req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
@@ -321,6 +346,7 @@ app.get("/_status", async (req, res) => {
       cachedFiles: cached.length,
       ongoing: Array.from(ongoing.keys()),
       ffmpegReady,
+      cookiesConfigured: !!cookiesPath,
     });
   } catch (e) {
     res.json({ error: String(e) });
@@ -335,6 +361,13 @@ prepareFfmpeg().finally(() => {
       console.warn(
         "Warning: ffmpeg/ffprobe not found. MP3 endpoint will not work until ffmpeg is available."
       );
+    }
+    if (!cookiesPath) {
+      console.warn(
+        "Warning: No cookies configured. YouTube downloads may fail. Set YT_C env variable or create cookies.txt file."
+      );
+    } else {
+      console.log("Cookies configured from:", cookiesPath);
     }
   });
 });
