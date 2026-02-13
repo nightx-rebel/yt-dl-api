@@ -1,5 +1,7 @@
 /**
- * @author nightx-rebel
+ * Render-ready accelerated yt-dlp downloader
+ * - prefers aria2c if available (installed in Dockerfile)
+ * - falls back to yt-dlp concurrent fragments
  */
 import express from "express";
 import fs from "fs";
@@ -11,61 +13,67 @@ import crypto from "crypto";
 import { YtDlp, helpers } from "ytdlp-nodejs";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 const CACHE_DIR = path.join(process.cwd(), "cache");
 const publicDir = path.join(process.cwd(), "public");
 const MAX_CACHE_FILES = parseInt(process.env.MAX_CACHE_FILES || "80", 10);
 
-fs.mkdirSync(CACHE_DIR, { recursive: true });
+// tuning env
+const DOWNLOAD_THREADS = Math.max(1, parseInt(process.env.DOWNLOAD_THREADS || "8", 10)); // default 8
+const USE_EXTERNAL_DOWNLOADER =
+  (process.env.USE_EXTERNAL_DOWNLOADER === "1" || process.env.USE_EXTERNAL_DOWNLOADER === "true") || true;
+// stream buffer
+const STREAM_HIGH_WATER_MARK = 1024 * 1024; // 1 MiB
 
-app.use(
-  express.text({ type: ["text/*", "application/octet-stream"], limit: "1mb" })
-);
-app.use(express.json({ limit: "1mb" }));
+fs.mkdirSync(CACHE_DIR, { recursive: true });
+if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+
+app.use(express.text({ type: ["text/*", "application/octet-stream"], limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 let cookiesPath = null;
 const cookieCandidate = path.join(process.cwd(), "cookies.txt");
 
+// load cookies from env YT_C (base64) or existing cookies.txt
 if (process.env.YT_C) {
   try {
+    const txt = Buffer.from(process.env.YT_C, "base64");
+    fs.writeFileSync(cookieCandidate, txt);
     cookiesPath = cookieCandidate;
-    if (!fs.existsSync(cookiesPath)) {
-      fs.writeFileSync(cookiesPath, Buffer.from(process.env.YT_C, "base64"));
-      console.log("cookies.txt written from YT_C env");
-    } else {
-      console.log("cookies.txt already exists, using it");
-    }
+    console.log("cookies.txt created from YT_C env");
   } catch (e) {
-    console.warn("Failed to write cookies from YT_C env:", e?.message || e);
-    cookiesPath = null;
+    console.warn("Failed to create cookies from YT_C:", e?.message || e);
   }
 } else if (fs.existsSync(cookieCandidate)) {
   cookiesPath = cookieCandidate;
-  console.log("Found existing cookies.txt");
+  console.log("Using existing cookies.txt");
 }
 
-// Helper utilities
 function hashUrl(url) {
   return crypto.createHash("sha256").update(url).digest("hex").slice(0, 18);
 }
-
 function tmpFileNameFor(id, ext) {
   return path.join(CACHE_DIR, `${id}.${ext}.part`);
 }
-
 function finalFilePathFor(id, ext) {
   return path.join(CACHE_DIR, `${id}.${ext}`);
 }
-
 function humanSafeName(name, ext) {
   const s = sanitize(name || "file").slice(0, 120) || "file";
   return `${s}.${ext}`;
 }
-
 function systemHasFfmpeg() {
   try {
-    const res = spawnSync("ffmpeg", ["-version"], { stdio: "ignore" });
-    return res.status === 0 || res.status === null || res.status === undefined;
+    const r = spawnSync("ffmpeg", ["-version"], { stdio: "ignore" });
+    return r.status === 0 || r.status === null || r.status === undefined;
+  } catch {
+    return false;
+  }
+}
+function systemHasAria2c() {
+  try {
+    const r = spawnSync("aria2c", ["--version"], { stdio: "ignore" });
+    return r.status === 0 || r.status === null || r.status === undefined;
   } catch {
     return false;
   }
@@ -76,77 +84,30 @@ async function moveFileAtomic(src, dest) {
     await fs.promises.rename(src, dest);
     return;
   } catch (err) {
-    // cross-device fallback
     if (err && (err.code === "EXDEV" || err.code === "EEXIST")) {
       await fs.promises.copyFile(src, dest);
-      try {
-        await fs.promises.unlink(src);
-      } catch (e) {
-        // ignore
-      }
+      try { await fs.promises.unlink(src); } catch {}
       return;
     }
     throw err;
   }
 }
-
-async function findCandidateAndMove(id, finalPath) {
-  const all = await fs.promises.readdir(CACHE_DIR);
-  const candidates = [];
-
-  for (const f of all) {
-    if (f.startsWith(id) && f !== path.basename(finalPath)) {
-      const full = path.join(CACHE_DIR, f);
-      try {
-        const s = await fs.promises.stat(full);
-        if (s.isFile() && s.size > 0) {
-          candidates.push({ path: full, size: s.size, mtime: s.mtimeMs });
-        }
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  if (candidates.length === 0) return false;
-
-  candidates.sort((a, b) => {
-    if (b.size !== a.size) return b.size - a.size;
-    return b.mtime - a.mtime;
-  });
-
-  const chosen = candidates[0].path;
-  await moveFileAtomic(chosen, finalPath);
-  return true;
-}
-
 async function pruneCache() {
   try {
     const files = await fs.promises.readdir(CACHE_DIR);
-    const filePaths = files.map((f) => path.join(CACHE_DIR, f));
-
-    const stats = await Promise.all(
-      filePaths.map(async (fp) => {
-        try {
-          const s = await fs.promises.stat(fp);
-          return { path: fp, mtime: s.mtimeMs, size: s.size };
-        } catch {
-          return null;
-        }
-      })
-    );
-
+    const stats = await Promise.all(files.map(async (f) => {
+      const fp = path.join(CACHE_DIR, f);
+      try { const s = await fs.promises.stat(fp); return { path: fp, mtime: s.mtimeMs, size: s.size }; }
+      catch { return null; }
+    }));
     const valid = stats.filter(Boolean).sort((a, b) => b.mtime - a.mtime);
-
     if (valid.length > MAX_CACHE_FILES) {
       const toRemove = valid.slice(MAX_CACHE_FILES);
-      await Promise.all(
-        toRemove.map((r) => fs.promises.unlink(r.path).catch(() => {}))
-      );
-      console.log("Pruned cache, removed", toRemove.length, "files");
+      await Promise.all(toRemove.map(r => fs.promises.unlink(r.path).catch(() => {})));
+      console.log("Pruned cache:", toRemove.length);
     }
   } catch (e) {
-    console.warn("pruneCache failed:", e?.message || e);
+    console.warn("pruneCache error:", e?.message || e);
   }
 }
 
@@ -157,33 +118,28 @@ let ytDlpBinaryReady = false;
 
 async function prepareYtDlpBinary() {
   try {
-    console.log("Ensuring yt-dlp binary is present...");
+    console.log("Ensuring yt-dlp binary...");
     await helpers.downloadYtDlp();
     ytDlpBinaryReady = true;
-    console.log("yt-dlp binary is ready.");
-  } catch (err) {
+  } catch (e) {
     ytDlpBinaryReady = false;
-    console.warn("Could not auto-download yt-dlp binary:", err?.message || err);
+    console.warn("yt-dlp binary download failed:", e?.message || e);
   }
 }
 
 async function prepareFfmpeg() {
   try {
-    console.log("Trying to auto-download ffmpeg via ytdlp-nodejs...");
-    await ytdlp.downloadFFmpeg();
-    ffmpegReady = true;
-    console.log("ffmpeg auto-downloaded (ytdlp-nodejs).");
-  } catch (err) {
-    console.warn("Auto-download ffmpeg failed:", err?.message || err);
+    console.log("Ensuring ffmpeg...");
+    await ytdlp.downloadFFmpeg().catch(()=>{});
     if (systemHasFfmpeg()) {
       ffmpegReady = true;
-      console.log("System ffmpeg available.");
+      console.log("system ffmpeg present");
     } else {
       ffmpegReady = false;
-      console.warn(
-        "ffmpeg not available. MP3 endpoint will be disabled until ffmpeg is installed."
-      );
+      console.warn("ffmpeg not available");
     }
+  } catch (e) {
+    console.warn("prepareFfmpeg error:", e?.message || e);
   }
 }
 
@@ -191,9 +147,7 @@ async function getTitleFallback(url, id) {
   try {
     const t = await ytdlp.getTitleAsync(url);
     if (t) return sanitize(t).slice(0, 140);
-  } catch {
-    // ignore
-  }
+  } catch {}
   return id;
 }
 
@@ -205,143 +159,115 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
   try {
     await fs.promises.access(finalPath, fs.constants.R_OK);
     const now = new Date();
-    await fs.promises.utimes(finalPath, now, now).catch(() => {});
+    await fs.promises.utimes(finalPath, now, now).catch(()=>{});
     return { path: finalPath, id, cached: true };
-  } catch {
-    // not cached
-  }
+  } catch {}
 
   const key = `${id}.${ext}`;
   if (ongoing.has(key)) return ongoing.get(key);
 
   const promise = (async () => {
-    try {
-      await fs.promises.unlink(tmpPath);
-    } catch {
-      // ignore
-    }
-
-    let title = id;
-    try {
-      title = await getTitleFallback(url, id);
-    } catch {
-      // ignore
-    }
-
+    try { await fs.promises.unlink(tmpPath).catch(()=>{}); } catch {}
     await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
 
-    // format options
+    let title = id;
+    try { title = await getTitleFallback(url, id); } catch {}
+
     const formatObj =
       ext === "mp3"
         ? { filter: "audioonly", type: "mp3", quality: "0" }
-        : { filter: "audioandvideo", type: "mp4", quality: "highest" };
+        : { filter: "audioandvideo", type: "mp4", quality: "best[ext=mp4]/best" };
 
-    const opts = {
-      output: tmpPath,
-      format: formatObj,
-      ...ytdlpOptions,
-    };
+    const opts = { output: tmpPath, format: formatObj, ...ytdlpOptions };
 
     try {
-      console.log("Starting ytdlp download:", url, "->", tmpPath);
+      console.log("Starting download:", url, "->", tmpPath);
       const builder = ytdlp.download(url, opts);
 
-      // apply cookies if available
+      // cookies
       let cookieApplied = false;
-      const useBrowserCookiesFlag =
-        process.env.USE_BROWSER_COOKIES === "1" ||
-        process.env.USE_BROWSER_COOKIES === "true";
-
+      const useBrowserCookiesFlag = process.env.USE_BROWSER_COOKIES === "1" || process.env.USE_BROWSER_COOKIES === "true";
       if (cookiesPath && fs.existsSync(cookiesPath)) {
-        try {
-          builder.cookies(cookiesPath);
-          console.log(
-            "Applied cookies file via builder.cookies():",
-            cookiesPath
-          );
-          cookieApplied = true;
-        } catch (e) {
-          try {
-            builder.addArgs("--cookies", cookiesPath);
-            console.log("Applied cookies via --cookies arg:", cookiesPath);
-            cookieApplied = true;
-          } catch (e2) {
-            console.warn(
-              "Failed to apply cookies via builder APIs:",
-              e2?.message || e2
-            );
-          }
-        }
+        try { builder.cookies(cookiesPath); cookieApplied = true; console.log("Applied cookies file"); }
+        catch (e) { try { builder.addArgs("--cookies", cookiesPath); cookieApplied = true; } catch {} }
       } else if (useBrowserCookiesFlag) {
-        try {
-          builder.cookiesFromBrowser("chrome");
-          console.log(
-            "Using cookiesFromBrowser('chrome') (USE_BROWSER_COOKIES=1)."
-          );
-          cookieApplied = true;
-        } catch (e) {
-          console.warn(
-            "cookiesFromBrowser failed (no accessible browser profile):",
-            e?.message || e
-          );
-        }
+        try { builder.cookiesFromBrowser("chrome"); cookieApplied = true; } catch (e){ console.warn("cookiesFromBrowser failed"); }
       }
-
       if (!cookieApplied && /youtube\.com|youtu\.be/.test(url)) {
-        console.warn(
-          "No cookies applied for YouTube URL. If YouTube requires login, export cookies to cookies.txt or set YT_C env."
-        );
+        console.warn("No cookies applied for YouTube URL. This may cause throttling or login problems.");
       }
 
-      if (ext === "mp3" && !ffmpegReady && !systemHasFfmpeg()) {
-        throw new Error(
-          "ffmpeg/ffprobe not available on server - mp3 cannot be created"
+      // acceleration: prefer aria2c if allowed & installed
+      const aria2cPresent = systemHasAria2c();
+      if (USE_EXTERNAL_DOWNLOADER && aria2cPresent) {
+        const x = Math.min(Math.max(2, DOWNLOAD_THREADS), 32); // clamp
+        const s = Math.min(Math.max(2, DOWNLOAD_THREADS), 32);
+        const k = "1M";
+        builder.addArgs(
+          "--external-downloader", "aria2c",
+          "--external-downloader-args", `-x ${x} -s ${s} -k ${k} --file-allocation=none --timeout=60 --max-connection-per-server=${x}`
         );
+        console.log(`Using aria2c external downloader (x=${x}, s=${s}).`);
+      } else {
+        // fallback to internal concurrency - use conservative numbers for Render
+        const threads = Math.min(Math.max(2, DOWNLOAD_THREADS), 8);
+        builder.addArgs(
+          "--concurrent-fragments", String(threads),
+          "--fragment-retries", "3",
+          "--retries", "5",
+          "--http-chunk-size", "5M"
+        );
+        console.log(`Using yt-dlp concurrent fragments=${threads}`);
       }
 
-      // run ytdlp
+      // common safe args
+      builder.addArgs(
+        "--no-playlist",
+        "--continue",
+        "--no-mtime",
+        "--socket-timeout", "20",
+        "--no-embed-metadata",
+        "--no-embed-thumbnail"
+      );
+
+      // reduce ffmpeg CPU threads for mp3 postprocessing
+      if (ext === "mp3") {
+        if (!ffmpegReady && !systemHasFfmpeg()) {
+          throw new Error("ffmpeg not available on server - mp3 cannot be created");
+        }
+        builder.addArgs("--postprocessor-args", "ffmpeg:-threads 1");
+      }
+
+      // run
       await builder.run();
 
+      // move to final
       try {
         await moveFileAtomic(tmpPath, finalPath);
       } catch (mvErr) {
-        if (
-          mvErr &&
-          (mvErr.code === "ENOENT" ||
-            mvErr.code === "EXDEV" ||
-            mvErr.code === "EEXIST")
-        ) {
-          const found = await findCandidateAndMove(id, finalPath);
-          if (!found) throw mvErr;
-        } else {
-          throw mvErr;
-        }
+        // fallback: look for other candidate parts
+        try {
+          const all = await fs.promises.readdir(CACHE_DIR);
+          const candidates = all.filter(f => f.startsWith(id) && f !== path.basename(finalPath));
+          if (candidates.length > 0) {
+            await moveFileAtomic(path.join(CACHE_DIR, candidates[0]), finalPath);
+          } else throw mvErr;
+        } catch (e) { throw mvErr; }
       }
 
+      // touch
       const now = new Date();
-      await fs.promises.utimes(finalPath, now, now).catch(() => {});
-      pruneCache().catch(() => {});
-      console.log("Download complete:", finalPath);
-
+      await fs.promises.utimes(finalPath, now, now).catch(()=>{});
+      pruneCache().catch(()=>{});
+      console.log("Done:", finalPath);
       return { path: finalPath, id, title, cached: false };
+
     } catch (err) {
-      try {
-        await fs.promises.unlink(tmpPath);
-      } catch {
-        // ignore
-      }
-
+      try { await fs.promises.unlink(tmpPath).catch(()=>{}); } catch {}
       const strErr = String(err || "");
-      if (
-        strErr.includes("Sign in to confirm you’re not a bot") ||
-        strErr.toLowerCase().includes("cookies") ||
-        strErr.toLowerCase().includes("could not find chrome cookies database")
-      ) {
-        throw new Error(
-          `${strErr}\n\nHint: Ensure cookies.txt exists and is in netscape format, or set USE_BROWSER_COOKIES=1 on a machine with Chrome profile access. You can create cookies.txt locally with: yt-dlp --cookies-from-browser chrome --cookies cookies.txt "https://www.youtube.com/watch?v=..."`
-        );
+      if (strErr.includes("Sign in to confirm you’re not a bot") || strErr.toLowerCase().includes("cookies")) {
+        throw new Error(`${strErr}\nHint: Provide cookies.txt or set USE_BROWSER_COOKIES=1 on a machine with Chrome profile access.`);
       }
-
       throw err;
     }
   })();
@@ -351,13 +277,7 @@ async function downloadAndCache(url, ext, ytdlpOptions = {}) {
   return promise;
 }
 
-async function serveFileWithRange(
-  req,
-  res,
-  filePath,
-  contentType,
-  suggestedName
-) {
+async function serveFileWithRange(req, res, filePath, contentType, suggestedName) {
   try {
     const stat = await fs.promises.stat(filePath);
     const total = stat.size;
@@ -365,22 +285,18 @@ async function serveFileWithRange(
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${suggestedName}"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="${suggestedName}"`);
 
     if (!range) {
       res.setHeader("Content-Length", total);
-      const stream = fs.createReadStream(filePath);
-      await pipeline(stream, res);
+      const rs = fs.createReadStream(filePath, { highWaterMark: STREAM_HIGH_WATER_MARK });
+      await pipeline(rs, res);
       return;
     }
 
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-
     if (isNaN(start) || isNaN(end) || start > end || end >= total) {
       res.status(416).setHeader("Content-Range", `bytes */${total}`).end();
       return;
@@ -390,12 +306,10 @@ async function serveFileWithRange(
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
     res.setHeader("Content-Length", chunkSize);
-    const stream = fs.createReadStream(filePath, { start, end });
-    await pipeline(stream, res);
+    const rs = fs.createReadStream(filePath, { start, end, highWaterMark: STREAM_HIGH_WATER_MARK });
+    await pipeline(rs, res);
   } catch (err) {
-    if (!res.headersSent) {
-      res.status(500).json({ error: "file serve error", detail: String(err) });
-    }
+    if (!res.headersSent) res.status(500).json({ error: "file serve error", detail: String(err) });
   }
 }
 
@@ -406,21 +320,14 @@ app.get("/", (req, res) => res.sendFile(path.join(publicDir, "index.html")));
 app.get("/api/mp3/url", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "missing url query param" });
-
   try {
     const id = hashUrl(url);
     const title = await getTitleFallback(url, id);
     const suggestedName = humanSafeName(title, "mp3");
     const result = await downloadAndCache(url, "mp3");
-    await serveFileWithRange(
-      req,
-      res,
-      result.path,
-      "audio/mpeg",
-      suggestedName
-    );
+    await serveFileWithRange(req, res, result.path, "audio/mpeg", suggestedName);
   } catch (err) {
-    console.error("MP3 endpoint error:", err?.message || err);
+    console.error("MP3 error:", err?.message || err);
     res.status(500).json({ error: "mp3 failed", detail: String(err) });
   }
 });
@@ -429,7 +336,6 @@ app.get("/api/mp3/url", async (req, res) => {
 app.get("/api/mp4/url", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "missing url query param" });
-
   try {
     const id = hashUrl(url);
     const title = await getTitleFallback(url, id);
@@ -437,15 +343,14 @@ app.get("/api/mp4/url", async (req, res) => {
     const result = await downloadAndCache(url, "mp4");
     await serveFileWithRange(req, res, result.path, "video/mp4", suggestedName);
   } catch (err) {
-    console.error("MP4 endpoint error:", err?.message || err);
+    console.error("MP4 error:", err?.message || err);
     res.status(500).json({ error: "mp4 failed", detail: String(err) });
   }
 });
 
-// status endpoint
 app.get("/_status", async (req, res) => {
   try {
-    const cached = await fs.promises.readdir(CACHE_DIR).catch(() => []);
+    const cached = await fs.promises.readdir(CACHE_DIR).catch(()=>[]);
     res.json({
       cacheDir: CACHE_DIR,
       cachedFiles: cached.length,
@@ -453,31 +358,21 @@ app.get("/_status", async (req, res) => {
       ffmpegReady,
       ytDlpBinaryReady,
       cookiesConfigured: !!cookiesPath,
-      useBrowserCookiesAllowed: !!(
-        process.env.USE_BROWSER_COOKIES === "1" ||
-        process.env.USE_BROWSER_COOKIES === "true"
-      ),
+      downloadThreads: DOWNLOAD_THREADS,
+      aria2cAvailable: systemHasAria2c(),
+      useExternalDownloader: USE_EXTERNAL_DOWNLOADER
     });
-  } catch (e) {
-    res.json({ error: String(e) });
-  }
+  } catch (e) { res.json({ error: String(e) }); }
 });
 
 app.post("/upload-cookies", async (req, res) => {
   try {
     let contents = null;
-
     if (req.is("application/json") && req.body && req.body.base64) {
       contents = Buffer.from(req.body.base64, "base64").toString("utf8");
     } else if (typeof req.body === "string" && req.body.trim().length > 0) {
       contents = req.body;
-    } else {
-      return res.status(400).json({
-        error:
-          "No cookie content provided. Send raw cookies text or JSON { base64 }.",
-      });
-    }
-
+    } else { return res.status(400).json({ error: "No cookie content provided." }); }
     await fs.promises.writeFile(cookieCandidate, contents);
     cookiesPath = cookieCandidate;
     return res.json({ ok: true, saved: cookieCandidate });
@@ -487,36 +382,15 @@ app.post("/upload-cookies", async (req, res) => {
   }
 });
 
-process.on("unhandledRejection", (r) => {
-  console.error("unhandledRejection:", r);
-});
+process.on("unhandledRejection", (r) => { console.error("unhandledRejection:", r); });
 
-// Boot sequence
 (async () => {
   await prepareYtDlpBinary();
   await prepareFfmpeg();
-
   app.listen(PORT, () => {
-    console.log(`Server listening on http://localhost:${PORT}`);
-
-    if (!ffmpegReady) {
-      console.warn(
-        "Warning: ffmpeg/ffprobe not found. MP3 endpoint will not work until ffmpeg is available."
-      );
-    }
-
-    if (!ytDlpBinaryReady) {
-      console.warn(
-        "Warning: yt-dlp binary may not have been downloaded automatically. If downloads fail, install yt-dlp on the system or allow auto-download."
-      );
-    }
-
-    if (!cookiesPath) {
-      console.warn(
-        "Warning: No cookies configured. YouTube downloads may fail. Set YT_C env variable or create cookies.txt file (or use /upload-cookies)."
-      );
-    } else {
-      console.log("Cookies configured from:", cookiesPath);
-    }
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+    console.log("Aria2c available:", systemHasAria2c());
+    console.log("DOWNLOAD_THREADS:", DOWNLOAD_THREADS);
+    console.log("USE_EXTERNAL_DOWNLOADER:", USE_EXTERNAL_DOWNLOADER);
   });
 })();
